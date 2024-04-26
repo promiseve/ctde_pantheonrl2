@@ -4,7 +4,7 @@ from overcooked_ai_py.mdp.actions import Action
 from overcooked_ai_py.mdp.overcooked_mdp import OvercookedGridworld
 from overcooked_ai_py.mdp.overcooked_env import OvercookedEnv
 from overcooked_ai_py.planning.planners import MediumLevelPlanner, NO_COUNTERS_PARAMS
-
+from gym import spaces
 from pantheonrl.common.multiagentenv import SimultaneousEnv
 
 class OvercookedMultiEnv(SimultaneousEnv):
@@ -99,3 +99,58 @@ class OvercookedMultiEnv(SimultaneousEnv):
 
     def render(self, mode='human', close=False):
         pass
+
+
+class OvercookedMultiEnvWrapper(gym.Env):
+    metadata = {'render.modes': ['human']}
+    
+    def __init__(self, env,layout_name= 'default_layout', num_agents=2):
+        super(OvercookedMultiEnvWrapper, self).__init__()
+        self.layout_name = layout_name
+        self.num_agents = num_agents
+        self.env = OvercookedMultiEnv(layout_name=self.layout_name)
+        #self.env = env
+        
+        # Assuming OvercookedMultiEnv already provides a tuple of observations for each agent
+        self.observation_space = spaces.Tuple([self.env.observation_space for _ in range(self.num_agents)])
+        
+        # Assuming each agent has the same action space
+        self.action_space = spaces.Tuple([self.env.action_space for _ in range(self.num_agents)])
+        
+        # Adjust reward and done to be per agent if not already
+        self.reward_range = (-float('inf'), float('inf'))
+
+    def step(self, actions):
+        # Convert tuple of actions into the format expected by the original env's step method
+        # This part may need to be adapted based on how the original env expects actions
+        obs, rewards, done, info = self.env.step(actions)
+
+        # Ensure rewards and done are per-agent if they are not already handled as such
+        if not isinstance(rewards, list):
+            rewards = [rewards] * self.num_agents
+        if not isinstance(done, list):
+            done = [done] * self.num_agents
+
+        return obs, rewards, done, info
+    
+    def getDummyEnv(self, player_num: int):
+        """
+        Returns a dummy environment with just an observation and action
+        space that a partner agent can use to construct their policy network.
+
+        :param player_num: the partner number to query
+        """
+        return self    
+
+    def reset(self):
+        # Reset the environment
+        obs = self.env.reset()
+        return obs
+
+    def render(self, mode='human'):
+        # Render the environment
+        return self.env.render(mode=mode)
+
+    def close(self):
+        # Close the environment
+        self.env.close()

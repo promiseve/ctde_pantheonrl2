@@ -1,13 +1,15 @@
 import argparse
 import json
 import gym
-
+import yaml
 import torch as th
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.monitor import Monitor
-
+from pantheonrl.epymarl_imports import QLearner, VDNMixer, QMixer, EpisodeBatch
+from pantheonrl.epymarl_imports.non_shared_controller import NonSharedMAC
+from pantheonrl.envs.epymarl_compat_wrapper import EpymarlCompatWrapper
 from pantheonrl.common.wrappers import frame_wrap, recorder_wrap
 from pantheonrl.common.agents import OnPolicyAgent, StaticPolicyAgent
 
@@ -26,11 +28,15 @@ from pantheonrl.envs.liargym.liar import LiarEnv, LiarDefaultAgent
 
 from overcookedgym.overcooked_utils import LAYOUT_LIST
 
+with open('vdn.yaml', 'r') as f:
+    vdn_config = yaml.safe_load(f)
+
+
 ENV_LIST = ['RPS-v0', 'BlockEnv-v0', 'BlockEnv-v1', 'LiarsDice-v0',
-            'OvercookedMultiEnv-v0']
+            'OvercookedMultiEnv-v0', 'OvercookedMultiEnvWrapper-v0']
 
 ADAP_TYPES = ['ADAP', 'ADAP_MULT']
-EGO_LIST = ['PPO', 'ModularAlgorithm', 'LOAD'] + ADAP_TYPES
+EGO_LIST = ['PPO', 'ModularAlgorithm', 'LOAD', 'QLearner'] + ADAP_TYPES
 PARTNER_LIST = ['PPO', 'DEFAULT', 'FIXED'] + ADAP_TYPES
 
 
@@ -90,7 +96,16 @@ def latent_check(args):
 
 
 def generate_env(args):
-    env = gym.make(args.env, **args.env_config)
+    # Conditionally create the environment based on the 'ego' parameter
+    if args.ego == 'QLearner':
+        # Assuming 'OvercookedMultiEnvWrapper-v0' needs to be used with QLearner
+        env = gym.make('OvercookedMultiEnvWrapper-v0', layout_name='simple', num_agents=2, env=gym.make('OvercookedMultiEnv-v0', layout_name='simple'))
+
+        # env = gym.make('OvercookedMultiEnvWrapper-v0', layout_name=args.env_config.get('layout_name'), ego_agent_idx=0,action_space_per_agent =5, observation_space_per_agent= 10)
+    else:
+        # Default to using 'OvercookedMultiEnv-v0' for other agents
+        env = gym.make(args.env, **args.env_config)
+    #env = gym.make(args.env, **args.env_config)
 
     altenv = env.getDummyEnv(1)
 
@@ -103,38 +118,157 @@ def generate_env(args):
 
     return env, altenv
 
+# def construct_scheme_from_env(env):
+#     """
+#     Constructs a scheme from the environment's observation and action spaces.
+#     """
+#     scheme = {
+#         'obs': {
+#             'vshape': env.observation_space.shape
+#         },
+#         'actions': {
+#             'vshape': env.action_space
+#         },
+#         'agents': env.num_agents
+#     }
+#     return scheme
+
+def construct_scheme_from_env(env):
+    """
+    Constructs a scheme from the environment's observation and action spaces.
+    """
+    # Adjusting the scheme to check for attributes in a wrapped environment
+    num_agents = getattr(env, 'num_agents', None)
+    if num_agents is None and hasattr(env, 'env') and hasattr(env.env, 'num_agents'):
+        num_agents = env.env.num_agents  # Accessing num_agents from the original env if wrapped
+    
+    if num_agents is None:
+        raise AttributeError("Environment must have 'num_agents' attribute")
+
+    # Assume that observation and action spaces are tuples containing spaces for each agent
+    # This might need adjustment based on the specific implementation of your wrapper
+    obs_shape = env.observation_space[0].shape if isinstance(env.observation_space, gym.spaces.Tuple) else env.observation_space.shape
+    action_shape = env.action_space[0].n if isinstance(env.action_space, gym.spaces.Tuple) else env.action_space.n
+
+    scheme = {
+        'obs': {
+            'vshape': obs_shape,
+            'group': 'agents'
+        },
+        'actions': {
+            'vshape': (action_shape,),
+            'group': 'agents',
+            'dtype': th.long
+        },
+        'avail_actions': {
+            'vshape': (action_shape,),
+            'group': 'agents',
+            'dtype': th.int
+        },
+        'reward': {'vshape': (1,)},
+        'terminated': {'vshape': (1,), 'dtype': th.uint8},
+        'agents': num_agents
+    }
+    return scheme
+
+def your_logger():
+    """
+    Returns a logger object to log training information.
+    """
+    import logging
+    logger = logging.getLogger('train_logger')
+    logger.setLevel(logging.INFO)
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    return logger
 
 def generate_ego(env, args):
-    kwargs = args.ego_config
-    kwargs['env'] = env
-    kwargs['device'] = args.device
-    if args.seed is not None:
-        kwargs['seed'] = args.seed
+    # Ensure that num_agents is set based on the environment
+    if hasattr(env, 'num_agents'):
+        args.n_agents = env.num_agents
+    elif hasattr(env, 'env') and hasattr(env.env, 'num_agents'):
+        args.n_agents = env.env.num_agents
+    else:
+        raise AttributeError("Environment does not have 'num_agents' attribute")
 
-    kwargs['tensorboard_log'] = args.tensorboard_log
-
+    scheme = construct_scheme_from_env(env)
+    mac = NonSharedMAC(scheme, None, args)
+    
+    # Determine which learner to initialize based on the 'ego' argument
     if args.ego == 'LOAD':
+        kwargs = args.ego_config
+        kwargs.update({
+            'env': env,
+            'device': args.device,
+            'seed': args.seed if args.seed is not None else None,
+            'tensorboard_log': args.tensorboard_log
+        })
         model = gen_load(kwargs, kwargs['type'], kwargs['location'])
-        # wrap env in Monitor and VecEnv wrapper
         vec_env = DummyVecEnv([lambda: Monitor(env)])
         model.set_env(vec_env)
         if kwargs['type'] == 'ModularAlgorithm':
             model.policy.do_init_weights(init_partner=True)
             model.policy.num_partners = len(args.alt)
         return model
-    elif args.ego == 'PPO':
-        return PPO(policy='MlpPolicy', **kwargs)
-    elif args.ego == 'ADAP':
-        return ADAP(policy=AdapPolicy, **kwargs)
-    elif args.ego == 'ADAP_MULT':
-        return ADAP(policy=AdapPolicyMult, **kwargs)
-    elif args.ego == 'ModularAlgorithm':
-        policy_kwargs = dict(num_partners=len(args.alt))
-        return ModularAlgorithm(policy=ModularPolicy,
-                                policy_kwargs=policy_kwargs,
-                                **kwargs)
+    elif args.ego in ['PPO', 'ADAP', 'ADAP_MULT', 'ModularAlgorithm']:
+        kwargs = {
+            'policy': 'MlpPolicy' if args.ego == 'PPO' else None,
+            'env': env,
+            'verbose': args.ego_config.get('verbose', 0),
+            'device': args.device,
+            'seed': args.seed,
+            'tensorboard_log': args.tensorboard_log
+        }
+        if args.ego == 'ModularAlgorithm':
+            kwargs['policy_kwargs'] = {'num_partners': len(args.alt)}
+        return globals()[args.ego](**kwargs)
+    elif args.ego == 'QLearner':
+        logger = your_logger()
+        return QLearner(mac=mac, scheme=scheme, logger=logger, args=args)
     else:
         raise EnvException("Not a valid policy")
+
+# def generate_ego(env, args):
+#     scheme = construct_scheme_from_env(env)
+#     mac = NonSharedMAC(scheme, None, args)
+#     ego_agent = QLearner(mac=mac, scheme=scheme, logger=your_logger(), args=args)    
+#     kwargs = args.ego_config
+#     kwargs['env'] = env
+#     kwargs['device'] = args.device
+#     if args.seed is not None:
+#         kwargs['seed'] = args.seed
+
+#     kwargs['tensorboard_log'] = args.tensorboard_log
+
+#     if args.ego == 'LOAD':
+#         model = gen_load(kwargs, kwargs['type'], kwargs['location'])
+#         # wrap env in Monitor and VecEnv wrapper
+#         vec_env = DummyVecEnv([lambda: Monitor(env)])
+#         model.set_env(vec_env)
+#         if kwargs['type'] == 'ModularAlgorithm':
+#             model.policy.do_init_weights(init_partner=True)
+#             model.policy.num_partners = len(args.alt)
+#         return model
+#     elif args.ego == 'PPO':
+#         return PPO(policy='MlpPolicy', **kwargs)
+#     elif args.ego == 'ADAP':
+#         return ADAP(policy=AdapPolicy, **kwargs)
+#     elif args.ego == 'ADAP_MULT':
+#         return ADAP(policy=AdapPolicyMult, **kwargs)
+#     elif args.ego == 'ModularAlgorithm':
+#         policy_kwargs = dict(num_partners=len(args.alt))
+#         return ModularAlgorithm(policy=ModularPolicy,
+#                                 policy_kwargs=policy_kwargs, **kwargs)
+#     elif args.ego == 'QLearner':
+#         scheme =  construct_scheme_from_env(env)
+#         groups = None
+#         mac = NonSharedMAC(scheme, groups, args)
+#         logger = your_logger()  # Define this function as needed
+#         return QLearner(mac=mac, scheme=scheme, logger=logger, args=args)                               
+#     else:
+#         raise EnvException("Not a valid policy")
 
 
 def gen_load(config, policy_type, location):
@@ -400,9 +534,15 @@ if __name__ == '__main__':
     if args.share_latent:
         latent_check(args)
 
+    if args.ego == 'QLearner':
+        # Load VDN.yaml and add its parameters to args.ego_config
+        with open('vdn.yaml', 'r') as f:
+            vdn_config = yaml.safe_load(f)
+        args.ego_config.update(vdn_config)
     print(f"Arguments: {args}")
     env, altenv = generate_env(args)
     print(f"Environment: {env}; Partner env: {altenv}")
+    #breakpoint()
     ego = generate_ego(env, args)
     print(f'Ego: {ego}')
     partners = generate_partners(altenv, env, ego, args)
